@@ -2,8 +2,8 @@ import { shellEscape, type ExecResult } from "./exec";
 
 // ─── File drop (drag media/ipa onto the simulator) ───
 //
-// Media → `xcrun simctl addmedia`   (Photos)
-// .ipa  → `xcrun simctl install`    (install app on simulator)
+// Media → `xcrun simctl addmedia` / Android Downloads + media scan
+// .ipa/.apk → app install on simulator/emulator
 //
 // Files are streamed to /tmp over /exec in base64-chunked bash `echo | base64 -d`
 // calls. No sonner dep here, so uploads surface in an inline toast list.
@@ -44,7 +44,7 @@ export async function addHostMediaToPhotos(
   }
 }
 
-export type DropKind = "media" | "ipa";
+export type DropKind = "media" | "ipa" | "apk";
 
 export function fileExtension(file: File): string {
   const name = file.name;
@@ -55,7 +55,9 @@ export function fileExtension(file: File): string {
 }
 
 export function dropKindFor(file: File): DropKind | null {
-  if (fileExtension(file) === "ipa") return "ipa";
+  const ext = fileExtension(file);
+  if (ext === "ipa") return "ipa";
+  if (ext === "apk") return "apk";
   if (DROP_MEDIA_MIME_TYPES.has(file.type)) return "media";
   return null;
 }
@@ -122,14 +124,19 @@ export async function uploadDroppedFile(
   kind: DropKind,
   exec: (command: string) => Promise<ExecResult>,
   udid: string,
+  platform: "ios" | "android",
   onProgress: (progress: number | null) => void,
 ) {
+  if ((platform === "ios" && kind === "apk") || (platform === "android" && kind === "ipa")) {
+    throw new Error(`${kind.toUpperCase()} files are not supported on ${platform}`);
+  }
+
   if (file.size > DROP_MAX_FILE_SIZE) {
     throw new Error("File too large (max 500MB)");
   }
 
-  const ext = kind === "ipa" ? "ipa" : fileExtension(file);
-  const prefix = kind === "ipa" ? "serve-sim-install" : "serve-sim-upload";
+  const ext = kind === "ipa" || kind === "apk" ? kind : fileExtension(file);
+  const prefix = kind === "ipa" || kind === "apk" ? "serve-sim-install" : "serve-sim-upload";
   const tmpPath = `/tmp/${prefix}-${crypto.randomUUID()}.${ext}`;
 
   try {
@@ -138,15 +145,34 @@ export async function uploadDroppedFile(
 
     // install/addmedia gives no progress signal — flip to indeterminate.
     onProgress(null);
-    const cmd = kind === "ipa"
-      ? `xcrun simctl install ${udid} ${tmpPath}`
-      : `xcrun simctl addmedia ${udid} ${tmpPath}`;
-    const result = await exec(cmd);
-    if (result.exitCode !== 0) {
-      const label = kind === "ipa" ? "install" : "addmedia";
+    const runCommand = async (cmd: string) => {
+      const result = await exec(cmd);
+      if (result.exitCode === 0) return;
+      const label = kind === "ipa" || kind === "apk" ? "install" : "addmedia";
       throw new Error(result.stderr || `${label} failed (exit ${result.exitCode})`);
+    };
+
+    const escapedUdid = shellEscape(udid);
+    const escapedTmpPath = shellEscape(tmpPath);
+    if (platform === "android") {
+      if (kind === "apk") {
+        await runCommand(`adb -s ${escapedUdid} install -r ${escapedTmpPath}`);
+      } else {
+        const basename = tmpPath.split("/").pop()!;
+        const devicePath = `/sdcard/Download/${basename}`;
+        await runCommand(`adb -s ${escapedUdid} push ${escapedTmpPath} ${shellEscape(devicePath)}`);
+        await runCommand(
+          `adb -s ${escapedUdid} shell am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d ${shellEscape(`file://${devicePath}`)}`,
+        );
+      }
+    } else {
+      await runCommand(
+        kind === "ipa"
+          ? `xcrun simctl install ${escapedUdid} ${escapedTmpPath}`
+          : `xcrun simctl addmedia ${escapedUdid} ${escapedTmpPath}`,
+      );
     }
   } finally {
-    exec(`bash -c 'rm -f ${tmpPath}'`).catch(() => {});
+    exec(`rm -f ${shellEscape(tmpPath)}`).catch(() => {});
   }
 }

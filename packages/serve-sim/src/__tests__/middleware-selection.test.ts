@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  isValidDeviceId,
   matchInstalledAppByDisplayName,
+  normalizeRequestPlatform,
   parseForegroundAppLogMessage,
   previewConfigForState,
   rewriteStateForRequestHost,
@@ -72,6 +74,34 @@ describe("previewConfigForState", () => {
     expect(
       previewConfigForState(states[0]!, "/preview", "/bin/serve-sim", "token-xyz", "mjpeg").codec,
     ).toBe("mjpeg");
+  });
+});
+
+describe("normalizeRequestPlatform", () => {
+  test("defaults missing platform to ios", () => {
+    expect(normalizeRequestPlatform(undefined)).toBe("ios");
+    expect(normalizeRequestPlatform(null)).toBe("ios");
+  });
+
+  test("accepts only known platforms", () => {
+    expect(normalizeRequestPlatform("ios")).toBe("ios");
+    expect(normalizeRequestPlatform("android")).toBe("android");
+    expect(normalizeRequestPlatform("andorid")).toBeNull();
+    expect(normalizeRequestPlatform(1)).toBeNull();
+  });
+});
+
+describe("isValidDeviceId", () => {
+  test("validates iOS devices as simulator UDIDs", () => {
+    expect(isValidDeviceId("01234567-89AB-CDEF-0123-456789ABCDEF", "ios")).toBe(true);
+    expect(isValidDeviceId("emulator-5554", "ios")).toBe(false);
+    expect(isValidDeviceId("not-a-uuid", "ios")).toBe(false);
+  });
+
+  test("allows Android emulator and device serials", () => {
+    expect(isValidDeviceId("emulator-5554", "android")).toBe(true);
+    expect(isValidDeviceId("ZY22:transport-1", "android")).toBe(true);
+    expect(isValidDeviceId("bad serial", "android")).toBe(false);
   });
 });
 

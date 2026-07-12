@@ -37,6 +37,8 @@ const WS_MSG_BUTTON = 0x04;
 const WS_MSG_MULTI_TOUCH = 0x05;
 const WS_MSG_DIGITAL_CROWN = 0x0a;
 const WS_MSG_SCROLL = 0x0b;
+const VIDEO_RELAY_STARTUP_ERROR_MS = 30000;
+const VIDEO_RELAY_STARTUP_SLOW_MS = 8000;
 
 export interface SimulatorViewProps {
   /** Base URL of the serve-sim server, e.g. "http://localhost:3100" */
@@ -68,6 +70,8 @@ export interface SimulatorViewProps {
   subscribeFrame?: (cb: (blobUrl: string) => void) => () => void;
   /** Relay mode: latest blob URL JPEG frame from the relay (used for initial render) */
   streamFrame?: string | null;
+  /** Relay mode: subscribe to decoded video frames. Callback must draw synchronously. */
+  subscribeVideoFrame?: (cb: (frame: any) => void) => () => void;
   /** Relay mode: screen config from relay */
   streamConfig?: StreamConfig | null;
   /** Called when the rendered stream reports new dimensions or orientation. */
@@ -121,6 +125,7 @@ export function SimulatorView({
   enableDigitalCrown,
   subscribeFrame,
   streamFrame: _streamFrame,
+  subscribeVideoFrame,
   streamConfig,
   onScreenConfigChange,
   hideControls,
@@ -130,6 +135,7 @@ export function SimulatorView({
   onAvccError,
 }: SimulatorViewProps) {
   const relayMode = !!onStreamTouch;
+  const videoRelayMode = relayMode && !!subscribeVideoFrame;
   // AVCC decode is independent of input relay: the H.264 pipeline only needs
   // `url`, so it runs in both direct and relay mode (input still forwards
   // through `onStreamTouch`). Falls back to the <img> when WebCodecs is
@@ -138,6 +144,7 @@ export function SimulatorView({
   const imgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const relayImgRef = useRef<HTMLImageElement | null>(null);
+  const relayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const inputLayerRef = useRef<HTMLDivElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -161,6 +168,10 @@ export function SimulatorView({
   }, []);
   const [fps, setFps] = useState(0);
   const frameCountRef = useRef(0);
+  const lastFrameAtRef = useRef(0);
+  const hasReceivedFrameRef = useRef(false);
+  const [hasReceivedFrame, setHasReceivedFrame] = useState(false);
+  const [startupSlow, setStartupSlow] = useState(false);
   const [showSlowOverlay, setShowSlowOverlay] = useState(false);
   const slowOverlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -189,7 +200,13 @@ export function SimulatorView({
 
   useEffect(() => {
     screenSizeRef.current = null;
+    lastFrameAtRef.current = 0;
+    hasReceivedFrameRef.current = false;
     setScreenSize(null);
+    setConnected(false);
+    setHasReceivedFrame(false);
+    setStartupSlow(false);
+    setError(null);
   }, [url]);
 
   const updateScreenConfig = useCallback((
@@ -231,7 +248,7 @@ export function SimulatorView({
   const paintedBlobUrlRef = useRef<string | null>(null);
   useEffect(() => {
     // AVCC paints the canvas via useAvccStream; skip the MJPEG relay <img>.
-    if (!relayMode || !subscribeFrame || useAvcc) return;
+    if (!relayMode || videoRelayMode || !subscribeFrame || useAvcc) return;
     // Startup watchdog: flag the stream as broken if no frame arrives within
     // the window. Catches the silent-failure mode where the helper accepts
     // the MJPEG connection but its underlying simulator was shut down —
@@ -263,6 +280,10 @@ export function SimulatorView({
 
     const unsubscribe = subscribeFrame((blobUrl) => {
       lastFrameAtRef.current = Date.now();
+      if (!hasReceivedFrameRef.current) {
+        hasReceivedFrameRef.current = true;
+        setHasReceivedFrame(true);
+      }
       // Latest-wins: a frame that arrived since the last paint is now stale —
       // release it so blob URLs don't accumulate between animation frames.
       if (pendingBlobUrlRef.current) URL.revokeObjectURL(pendingBlobUrlRef.current);
@@ -286,7 +307,56 @@ export function SimulatorView({
         paintedBlobUrlRef.current = null;
       }
     };
-  }, [relayMode, subscribeFrame, useAvcc]);
+  }, [relayMode, videoRelayMode, subscribeFrame, useAvcc]);
+
+  useEffect(() => {
+    if (!videoRelayMode || !subscribeVideoFrame) return;
+    setError(null);
+    setStartupSlow(false);
+    const slowWatchdog = setTimeout(() => {
+      if (!connectedRef.current && !hasReceivedFrameRef.current) {
+        setStartupSlow(true);
+      }
+    }, VIDEO_RELAY_STARTUP_SLOW_MS);
+    const errorWatchdog = setTimeout(() => {
+      if (!connectedRef.current && !hasReceivedFrameRef.current) {
+        setError("Android stream is still starting. Try reconnecting if it does not appear.");
+      }
+    }, VIDEO_RELAY_STARTUP_ERROR_MS);
+
+    const unsubscribe = subscribeVideoFrame((frame) => {
+      const width = Number(frame.displayWidth || frame.codedWidth || 0);
+      const height = Number(frame.displayHeight || frame.codedHeight || 0);
+      const canvas = relayCanvasRef.current;
+      const ctx = canvas?.getContext("2d", { alpha: false });
+      if (!canvas || !ctx || width <= 0 || height <= 0) return;
+
+      if (canvas.width !== width) canvas.width = width;
+      if (canvas.height !== height) canvas.height = height;
+      ctx.drawImage(frame, 0, 0, width, height);
+      updateScreenConfig({ width, height });
+
+      frameCountRef.current++;
+      lastFrameAtRef.current = Date.now();
+      if (!hasReceivedFrameRef.current) {
+        hasReceivedFrameRef.current = true;
+        setHasReceivedFrame(true);
+      }
+      setStartupSlow(false);
+      if (!connectedRef.current) {
+        clearTimeout(slowWatchdog);
+        clearTimeout(errorWatchdog);
+        setConnected(true);
+        setError(null);
+      }
+    });
+
+    return () => {
+      clearTimeout(slowWatchdog);
+      clearTimeout(errorWatchdog);
+      unsubscribe?.();
+    };
+  }, [videoRelayMode, subscribeVideoFrame, updateScreenConfig]);
 
   // AVCC (H.264) decode → canvas. Inert unless `useAvcc`. Works in both
   // direct and relay mode (it only needs `url`).
@@ -532,15 +602,13 @@ export function SimulatorView({
     };
   }, [url, streamUrl, relayMode, updateScreenConfig, wsUrlProp, useAvcc]);
 
-  // FPS counter + stale-frame detection for relay mode.
-  // Unlike non-relay mode (where WS close flips connected=false), relay mode
-  // only knows the stream is alive when frames arrive. Without this, killing
-  // the upstream helper leaves the UI stuck on "live" forever.
-  const lastFrameAtRef = useRef(0);
+  // FPS counter + stale-frame detection for relay mode. Android H.264 can
+  // legitimately pause decoded frames on an idle screen after the first image.
   useEffect(() => {
     if (!relayMode) return;
     const STALE_MS = 2000;
     const checkStaleness = () => {
+      if (videoRelayMode) return;
       const last = lastFrameAtRef.current;
       if (!last || !connectedRef.current) return;
       if (Date.now() - last > STALE_MS) setConnected(false);
@@ -559,12 +627,13 @@ export function SimulatorView({
       clearInterval(interval);
       document.removeEventListener("visibilitychange", onVis);
     };
-  }, [relayMode]);
+  }, [relayMode, videoRelayMode]);
 
   const getViewElement = useCallback(() => {
-    if (useAvcc) return canvasRef.current;
+    if (useAvcc && !videoRelayMode) return canvasRef.current;
+    if (videoRelayMode) return relayCanvasRef.current;
     return relayMode ? relayImgRef.current : imgRef.current;
-  }, [relayMode, useAvcc]);
+  }, [relayMode, useAvcc, videoRelayMode]);
 
   const getInputRect = useCallback(() => {
     return surfaceRef.current?.getBoundingClientRect()
@@ -848,12 +917,12 @@ export function SimulatorView({
             cornerShape: clipStyle?.cornerShape,
           } as CSSProperties}
         >
-        {useAvcc ? (
+        {useAvcc && !videoRelayMode ? (
           <canvas ref={canvasRef} style={canvasStyle} />
         ) : (
           <img
             ref={imgRef}
-            src={relayMode ? undefined : streamUrl}
+            src={relayMode || videoRelayMode ? undefined : streamUrl}
             draggable={false}
             onLoad={(e) => {
               const el = e.currentTarget;
@@ -861,10 +930,10 @@ export function SimulatorView({
                 updateScreenConfig({ width: el.naturalWidth, height: el.naturalHeight });
               }
             }}
-            style={relayMode ? { display: "none" } : streamImageStyle}
+            style={relayMode || videoRelayMode ? { display: "none" } : streamImageStyle}
           />
         )}
-        {relayMode && !useAvcc && (
+        {relayMode && !videoRelayMode && !useAvcc && (
           <img
             ref={relayImgRef}
             draggable={false}
@@ -874,6 +943,12 @@ export function SimulatorView({
                 updateScreenConfig({ width: el.naturalWidth, height: el.naturalHeight });
               }
             }}
+            style={streamImageStyle}
+          />
+        )}
+        {videoRelayMode && (
+          <canvas
+            ref={relayCanvasRef}
             style={streamImageStyle}
           />
         )}
@@ -1168,9 +1243,11 @@ export function SimulatorView({
             />
           </>
         )}
-        {!connected && !error && (
+        {!connected && !error && !hasReceivedFrame && (
           <div style={{...overlayStyle, ...(imageStyle || {})}}>
-            <span style={{ color: "#888", fontSize: 14 }}>Connecting...</span>
+            <span style={{ color: "#888", fontSize: 14 }}>
+              {startupSlow ? "Starting video..." : "Connecting..."}
+            </span>
           </div>
         )}
         {error && (

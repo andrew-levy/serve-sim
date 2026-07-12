@@ -23,6 +23,12 @@ import { axFrontmostAsync } from "./native";
 import { inProcessServeSimState, writeServeSimState, type ServeSimDeviceState } from "./state";
 import { debugMw } from "./debug";
 import {
+  androidDeviceBootStatus,
+  findAdb,
+  listAndroidTargets,
+  shutdownAndroidDevice,
+} from "./android-device";
+import {
   resolveDevicePlaceholderAsset,
   resolveDeviceKitChrome,
   serveDeviceKitChromeAsset,
@@ -97,14 +103,19 @@ type SimctlAllList = {
   devices: Record<string, Array<Omit<SimctlDevice, "runtime">>>;
 };
 
-type ShutdownRequestBody = { udid?: string };
-type StartRequestBody = { udid?: string };
+type DevicePlatform = "ios" | "android";
+type ShutdownRequestBody = { udid?: string; platform?: unknown };
+type StartRequestBody = { udid?: string; platform?: unknown };
 type ReleaseRequestBody = { targetId?: string };
 type HighlightRequestBody = { targetId?: string; on?: boolean };
 type ExecRequestBody = { command?: string };
 
 /** Re-exported alias for the canonical device-state record in `./state`. */
-export type ServeSimState = ServeSimDeviceState;
+export type ServeSimState = ServeSimDeviceState & {
+  platform?: DevicePlatform;
+  name?: string;
+  runtime?: string;
+};
 
 const axStreamerCache = createAxStreamerCache();
 
@@ -164,6 +175,18 @@ function isUserFacingBundle(bundleId: string): boolean {
 
 function isSimulatorUdid(value: string): boolean {
   return /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i.test(value);
+}
+
+export function normalizeRequestPlatform(value: unknown): DevicePlatform | null {
+  if (value == null) return "ios";
+  return value === "ios" || value === "android" ? value : null;
+}
+
+export function isValidDeviceId(value: string, platform: DevicePlatform): boolean {
+  if (!value) return false;
+  return platform === "android"
+    ? /^[A-Za-z0-9_.:-]+$/.test(value)
+    : /^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i.test(value);
 }
 
 /** What to do with a persisted device state when reaping during a grid poll. */
@@ -332,6 +355,18 @@ export async function readServeSimStates(): Promise<ServeSimState[]> {
       // would accept connections yet never produce frames, leaving the
       // preview stuck on "Connecting...". Recycle the stale state so the
       // caller can spawn a fresh helper bound to whatever is booted.
+      const platform = state.platform ?? "ios";
+      const androidGone = platform === "android" && androidDeviceBootStatus(state.device) === "not_booted";
+      if (androidGone) {
+        debugMw(
+          "recycling stale helper pid=%d (device %s no longer booted)",
+          state.pid,
+          state.device,
+        );
+        try { process.kill(state.pid, "SIGTERM"); } catch {}
+        try { unlinkSync(path); } catch {}
+        continue;
+      }
       const action = classifyStaleState(state, booted, process.pid);
       if (action !== "keep") {
         if (action === "recycle-self") {
@@ -359,6 +394,11 @@ export async function readServeSimStates(): Promise<ServeSimState[]> {
     } catch {}
   }
   return states;
+}
+
+function stopServeSimState(state: ServeSimState): void {
+  try { process.kill(state.pid, "SIGTERM"); } catch {}
+  try { unlinkSync(join(STATE_DIR, `server-${state.device}.json`)); } catch {}
 }
 
 export function selectServeSimState(
@@ -1026,6 +1066,7 @@ function loadHtml(): string {
 }
 
 interface SimctlDevice {
+  platform?: DevicePlatform;
   udid: string;
   name: string;
   state: string;
@@ -1041,23 +1082,32 @@ function listAllSimulators(): Promise<SimctlDevice[]> {
       ["simctl", "list", "devices", "-j"],
       { encoding: "utf-8", timeout: 3_000 },
       (err, stdout) => {
-        if (err) return resolve([]);
-        try {
-          const data = JSON.parse(stdout) as SimctlAllList;
-          const out: SimctlDevice[] = [];
-          for (const [runtime, devices] of Object.entries(data.devices)) {
-            // Keep this to touch-capable simulator families that serve-sim can
-            // frame and inject into. tvOS is intentionally left out for now.
-            if (!/SimRuntime\.(iOS|watchOS|visionOS|xrOS)-/i.test(runtime)) continue;
-            for (const d of devices) {
-              if (d.isAvailable === false) continue;
-              out.push({ ...d, runtime: runtime.replace(/^.*SimRuntime\./, "") });
+        const out: SimctlDevice[] = [];
+        if (!err) {
+          try {
+            const data = JSON.parse(stdout) as SimctlAllList;
+            for (const [runtime, devices] of Object.entries(data.devices)) {
+              // Keep this to touch-capable simulator families that serve-sim can
+              // frame and inject into. tvOS is intentionally left out for now.
+              if (!/SimRuntime\.(iOS|watchOS|visionOS|xrOS)-/i.test(runtime)) continue;
+              for (const d of devices) {
+                if (d.isAvailable === false) continue;
+                out.push({ ...d, platform: "ios", runtime: runtime.replace(/^.*SimRuntime\./, "") });
+              }
             }
-          }
-          resolve(out);
-        } catch {
-          resolve([]);
+          } catch {}
         }
+        for (const d of listAndroidTargets()) {
+          out.push({
+            platform: "android",
+            udid: d.device,
+            name: d.name,
+            runtime: d.runtime,
+            state: d.state,
+            isAvailable: true,
+          });
+        }
+        resolve(out);
       },
     );
   });
@@ -1174,6 +1224,36 @@ function buildMemoryReport(): MemoryReport {
     perSimSource,
     estimatedAdditional,
   };
+}
+
+/**
+ * Locate the `serve-sim` CLI binary so the grid can spawn helpers via
+ * `serve-sim --detach <udid>`. Tries, in order:
+ *   1. argv[0] if it ends in `serve-sim` (we're running inside the
+ *      compiled standalone binary, which IS the CLI)
+ *   2. `serve-sim` on PATH (npm-installed / bun-installed CLI)
+ * Returns the resolved command + args ready for spawn.
+ */
+function resolveServeSimCommand(): { command: string; baseArgs: string[] } | null {
+  // 1. Compiled standalone binary: argv[0] is the serve-sim-szdziedzic binary itself.
+  if (process.argv[0] && /(^|\/)serve-sim-szdziedzic$/.test(process.argv[0])) {
+    return { command: process.argv[0], baseArgs: [] };
+  }
+  // 2. Running the JS bundle directly: `node /path/to/serve-sim.js`. The
+  // bundle file name stays `serve-sim.js` even after the package rename.
+  if (process.argv[1] && /(^|\/)serve-sim\.js$/.test(process.argv[1])) {
+    return { command: process.argv[0]!, baseArgs: [process.argv[1]!] };
+  }
+  // 3. Global install: serve-sim-szdziedzic on PATH.
+  try {
+    const path = execSync("command -v serve-sim-szdziedzic", {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1_500,
+    }).trim();
+    if (path) return { command: path, baseArgs: [] };
+  } catch {}
+  return null;
 }
 
 export interface SimMiddlewareOptions {
@@ -1395,9 +1475,10 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         if (/iphone/i.test(name)) return 0;
         if (/ipad/i.test(name)) return 1;
         if (/watch/i.test(name)) return 2;
-        if (/(apple\s*tv|^tv\b)/i.test(name)) return 3;
-        if (/vision|reality/i.test(name)) return 4;
-        return 5;
+        if (/pixel|android|sdk|phone/i.test(name)) return 3;
+        if (/(apple\s*tv|^tv\b)/i.test(name)) return 4;
+        if (/vision|reality/i.test(name)) return 5;
+        return 6;
       };
       // Lower is higher in the list: streaming > selected > booted > last-opened
       // > rest. The active `?device=` selection is ranked near the top so it's
@@ -1433,6 +1514,7 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         const remoteHelper = helper ? rewriteStateForRequestHost(helper, hostForRequest(req), base, httpProtocolForRequest(req), proxyHelpers) : null;
         return {
           device: d.udid,
+          platform: d.platform ?? "ios",
           name: d.name,
           runtime: d.runtime,
           state: d.state,
@@ -1458,29 +1540,61 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       return;
     }
 
-    // Shutdown a booted simulator. Any running helper for the device is reaped
-    // by readServeSimStates() on the next /grid/api poll (it kills helpers
-    // whose backing simulator is no longer in the booted set).
+    // Shutdown a booted simulator/emulator. Physical Android devices cannot be
+    // powered off here, but a live stream can still be stopped safely.
     if (url === base + "/grid/api/shutdown" && req.method === "POST") {
       let body = "";
       req.on("data", (chunk: Buffer | string) => {
         body += typeof chunk === "string" ? chunk : chunk.toString();
       });
-      req.on("end", () => {
+      req.on("end", async () => {
         let udid = "";
-        try { udid = (JSON.parse(body) as ShutdownRequestBody).udid ?? ""; } catch {}
-        if (!/^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i.test(udid)) {
+        let platform: DevicePlatform = "ios";
+        try {
+          const parsed = JSON.parse(body) as ShutdownRequestBody;
+          udid = parsed.udid ?? "";
+          const parsedPlatform = normalizeRequestPlatform(parsed.platform);
+          if (!parsedPlatform) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "Invalid platform" }));
+            return;
+          }
+          platform = parsedPlatform;
+        } catch {}
+        if (!isValidDeviceId(udid, platform)) {
           res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: false, error: "Invalid or missing udid" }));
+          res.end(JSON.stringify({ ok: false, error: "Invalid or missing device id" }));
           return;
         }
         // Stop our own in-process capture for this device first (no-op if it
         // isn't streamed here). This frees the native session immediately
         // rather than waiting for the next poll's reaper to notice.
-        closeDeviceSession(udid);
+        if (platform === "ios") closeDeviceSession(udid);
         // Drop the snapshot so the next /grid/api call re-queries simctl
         // and prunes any helper bound to this now-shutdown device.
         bootedSnapshot = { at: 0, booted: null };
+        if (platform === "android") {
+          const states = await readServeSimStates();
+          const state = states.find((s) => s.device === udid && (s.platform ?? "ios") === "android");
+          if (state && !udid.startsWith("emulator-")) {
+            stopServeSimState(state);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, stopped: true, shutdown: false }));
+            return;
+          }
+          try {
+            shutdownAndroidDevice(udid);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true }));
+          } catch (err) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              ok: false,
+              error: err instanceof Error ? err.message : String(err),
+            }));
+          }
+          return;
+        }
         execFile("xcrun", ["simctl", "shutdown", udid], { timeout: 30_000 }, (err, _stdout, stderr) => {
           if (err) {
             res.writeHead(500, { "Content-Type": "application/json" });
@@ -1497,8 +1611,8 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       return;
     }
 
-    // Start streaming a device in-process (auto-boots if needed). The preview
-    // server serves its /helper routes directly — no spawned helper.
+    // Start streaming a device. iOS boots in-process; Android spawns a detached
+    // serve-sim helper bound to the emulator or physical device.
     if (url === base + "/grid/api/start" && req.method === "POST") {
       let body = "";
       req.on("data", (chunk: Buffer | string) => {
@@ -1506,10 +1620,64 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       });
       req.on("end", () => {
         let udid = "";
-        try { udid = (JSON.parse(body) as StartRequestBody).udid ?? ""; } catch {}
-        if (!/^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$/i.test(udid)) {
+        let platform: DevicePlatform = "ios";
+        try {
+          const parsed = JSON.parse(body) as StartRequestBody;
+          udid = parsed.udid ?? "";
+          const parsedPlatform = normalizeRequestPlatform(parsed.platform);
+          if (!parsedPlatform) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "Invalid platform" }));
+            return;
+          }
+          platform = parsedPlatform;
+        } catch {}
+        if (!isValidDeviceId(udid, platform)) {
           res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: false, error: "Invalid or missing udid" }));
+          res.end(JSON.stringify({ ok: false, error: "Invalid or missing device id" }));
+          return;
+        }
+        if (platform === "android") {
+          const resolved = resolveServeSimCommand();
+          if (!resolved) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              ok: false,
+              error: "serve-sim CLI not found in PATH. Install it (npm i -g serve-sim-szdziedzic) and retry.",
+            }));
+            return;
+          }
+          const child = spawn(
+            resolved.command,
+            [...resolved.baseArgs, "--detach", "--platform", platform, udid],
+            { stdio: ["ignore", "pipe", "pipe"], detached: false },
+          );
+          let stdout = "";
+          let stderr = "";
+          child.stdout?.on("data", (c: Buffer) => { stdout += c.toString(); });
+          child.stderr?.on("data", (c: Buffer) => { stderr += c.toString(); });
+          const timer = setTimeout(() => {
+            try { child.kill("SIGTERM"); } catch {}
+          }, 180_000);
+          child.on("close", (code) => {
+            clearTimeout(timer);
+            if (res.writableEnded) return;
+            if (code === 0) {
+              let device = udid;
+              try {
+                const parsed = JSON.parse(stdout.trim());
+                device = parsed.device ?? device;
+              } catch {}
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: true, stdout: stdout.trim(), device }));
+            } else {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({
+                ok: false,
+                error: stderr.trim() || stdout.trim() || `serve-sim exited with code ${code}`,
+              }));
+            }
+          });
           return;
         }
         const port = req.socket.localPort ?? 0;
@@ -1804,6 +1972,11 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         res.end("No serve-sim device");
         return;
       }
+      if ((state.platform ?? "ios") === "android") {
+        res.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
+        res.end("Accessibility not available for Android");
+        return;
+      }
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -1896,6 +2069,62 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
       return;
     }
 
+    // SSE: simctl / adb log stream
+    if (url === base + "/logs") {
+      const states = await readServeSimStates();
+      const state = selectServeSimState(states, selectedDevice);
+      if (!state) {
+        res.writeHead(404);
+        res.end("No serve-sim device");
+        return;
+      }
+      const udid = state.device;
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      res.write(":\n\n");
+
+      const isAndroid = (state.platform ?? "ios") === "android";
+      const child: ChildProcess = isAndroid
+        ? spawn(findAdb() ?? "adb", ["-s", udid, "logcat", "-v", "threadtime"], { stdio: ["ignore", "pipe", "ignore"] })
+        : spawn("xcrun", [
+            "simctl", "spawn", udid, "log", "stream",
+            "--style", "ndjson",
+            "--level", "info",
+          ], { stdio: ["ignore", "pipe", "ignore"] });
+
+      let buf = "";
+      child.stdout!.on("data", (chunk: Buffer) => {
+        buf += chunk.toString();
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (line) {
+            res.write(
+              "data: " +
+              (isAndroid
+                ? JSON.stringify({ processImagePath: "adb logcat", eventMessage: line, messageType: "info" })
+                : line) +
+              "\n\n",
+            );
+          }
+        }
+        if (buf.length > SSE_LINE_BUFFER_LIMIT) buf = "";
+      });
+
+      child.on("error", () => { try { res.end(); } catch {} });
+      child.on("close", () => res.end());
+      req.on("close", () => {
+        child.stdout?.destroy();
+        child.kill();
+      });
+      return;
+    }
+
     // SSE: foreground-app change stream. Emits `{bundleId, pid}` events
     // parsed from SpringBoard's "Setting process visibility to: Foreground"
     // log line. Filtering is done here (not in the browser) so the SSE stream
@@ -1916,6 +2145,37 @@ export function simMiddleware(options?: SimMiddlewareOptions): SimMiddleware {
         "X-Accel-Buffering": "no",
       });
       res.write(":\n\n");
+
+      if ((state.platform ?? "ios") === "android") {
+        let closed = false;
+        let lastBundle = "";
+        const poll = async () => {
+          if (closed || res.writableEnded) return;
+          try {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), 1500);
+            const r = await fetch(`http://127.0.0.1:${state.port}/foreground`, { signal: ctrl.signal });
+            clearTimeout(timer);
+            if (r.ok) {
+              const info = await r.json() as { bundleId?: string; pid?: number };
+              if (info.bundleId && info.bundleId !== lastBundle) {
+                lastBundle = info.bundleId;
+                res.write("data: " + JSON.stringify({
+                  bundleId: info.bundleId,
+                  pid: info.pid,
+                  isReactNative: /^host\.exp\.|expo|\.rn/i.test(info.bundleId),
+                }) + "\n\n");
+              }
+            }
+          } catch {}
+          if (!closed) setTimeout(poll, 1000);
+        };
+        void poll();
+        req.on("close", () => {
+          closed = true;
+        });
+        return;
+      }
 
       // Bootstrap: SpringBoard's log feed is edge-triggered, so a fresh
       // subscriber would otherwise see nothing until the user re-foregrounds

@@ -28,6 +28,7 @@ import {
 
 import { Globe, PanelRight, Upload } from "lucide-react";
 import { ReloadIcon } from "./icons";
+import { AndroidDeviceControls } from "./components/android-device-controls";
 import { AxDomOverlay } from "./components/ax-dom-overlay";
 import { AxStateProvider } from "./components/ax-state-provider";
 import { AxToolbarButton } from "./components/ax-toolbar-button";
@@ -35,6 +36,8 @@ import { DeviceSidebarToggle } from "./components/device-sidebar-toggle";
 import { DevicePlaceholder } from "./components/device-placeholder";
 import { DeviceKitChrome, type ChromeButtonPress } from "./components/device-chrome-frame";
 import { GridPanel } from "./components/grid-panel";
+import { PlatformBadge } from "./components/platform-badge";
+import type { DevicePlatform } from "./components/platform-badge";
 import { ResizeHandle } from "./components/resize-handle";
 import { SimulatorResizeCornerHandle } from "./components/simulator-resize-corner-handle";
 import { ServeSimToaster } from "./components/app-toasts";
@@ -47,6 +50,7 @@ import {
 } from "./components/stream-settings-tool";
 import { WebKitDevtoolsPanel } from "./components/webkit-devtools-panel";
 import { useMediaDrop } from "./hooks/use-media-drop";
+import { useH264Stream } from "./hooks/use-h264-stream";
 import { useMjpegStream } from "./hooks/use-mjpeg-stream";
 import { useAvccStream } from "./hooks/use-avcc-stream";
 import { useResizableWidth } from "./hooks/use-resizable-width";
@@ -185,10 +189,11 @@ function App() {
       setStarting((p) => ({ ...p, [udid]: true }));
       setActionErrors((e) => ({ ...e, [udid]: null }));
       try {
+        const device = gridDevices?.find((d) => d.device === udid);
         const res = await fetch(gridStartEndpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ udid }),
+          body: JSON.stringify({ udid, platform: device?.platform ?? "ios" }),
         });
         const json = await res.json().catch(() => ({}));
         if (!res.ok || !json.ok) {
@@ -206,7 +211,7 @@ function App() {
         refreshGrid();
       }
     },
-    [gridStartEndpoint, waitForHelper, refreshGrid],
+    [gridStartEndpoint, waitForHelper, refreshGrid, gridDevices],
   );
 
   const shutdownDevice = useCallback(
@@ -214,10 +219,11 @@ function App() {
       setShuttingDown((s) => ({ ...s, [udid]: true }));
       setActionErrors((e) => ({ ...e, [udid]: null }));
       try {
+        const device = gridDevices?.find((d) => d.device === udid);
         const res = await fetch(gridShutdownEndpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ udid }),
+          body: JSON.stringify({ udid, platform: device?.platform ?? "ios" }),
         });
         const json = await res.json().catch(() => ({}));
         if (!res.ok || !json.ok) {
@@ -230,7 +236,7 @@ function App() {
         refreshGrid();
       }
     },
-    [gridShutdownEndpoint, refreshGrid],
+    [gridShutdownEndpoint, refreshGrid, gridDevices],
   );
 
   // Pick a sensible default device once the grid loads and nothing is selected:
@@ -294,6 +300,7 @@ function App() {
         config={config}
         deviceName={selectedDevice?.name ?? null}
         deviceRuntime={selectedDevice?.runtime ?? null}
+        platform={selectedDevice?.platform ?? config.platform ?? "ios"}
         chrome={selectedDevice?.chrome ?? null}
         preferMjpeg={uiStarted.has(config.device)}
         axOverlayEnabled={axOverlayEnabled}
@@ -379,6 +386,7 @@ interface AppWithConfigProps {
   config: PreviewConfig;
   deviceName: string | null;
   deviceRuntime: string | null;
+  platform: DevicePlatform;
   chrome: DeviceKitChromeDescriptor | null;
   preferMjpeg: boolean;
   axOverlayEnabled: boolean;
@@ -398,6 +406,7 @@ function AppWithConfig({
   config,
   deviceName,
   deviceRuntime,
+  platform: platformProp,
   chrome,
   preferMjpeg,
   axOverlayEnabled,
@@ -412,22 +421,40 @@ function AppWithConfig({
   streaming,
   setStreaming,
 }: AppWithConfigProps) {
+  const platform = platformProp ?? config.platform ?? "ios";
+  const isAndroid = platform === "android";
+  const supportsAx = !isAndroid;
+  const supportsWebKitDevtools = !isAndroid;
+
   useEffect(() => {
-    document.title = deviceName ? `Simulator - ${deviceName}` : "Simulator Preview";
-  }, [deviceName]);
+    document.title = deviceName
+      ? `${platform === "android" ? "Android" : "Simulator"} - ${deviceName}`
+      : "Simulator Preview";
+  }, [deviceName, platform]);
 
   const deviceType: DeviceType = getDeviceType(deviceName);
-  const devtools = useWebKitDevtools(config.devtoolsEndpoint ?? simEndpoint("devtools"), devtoolsOpen);
+  const effectiveDevtoolsOpen = supportsWebKitDevtools && devtoolsOpen;
+  const devtools = useWebKitDevtools(
+    supportsWebKitDevtools ? (config.devtoolsEndpoint ?? simEndpoint("devtools")) : undefined,
+    effectiveDevtoolsOpen,
+  );
 
   useEffect(() => {
-    if (!devtoolsOpen) return;
+    if (!effectiveDevtoolsOpen) return;
     if (selectedDevtoolsTargetId && devtools.targets.some((target) => target.id === selectedDevtoolsTargetId)) return;
     setSelectedDevtoolsTargetId(devtools.targets.length === 1 ? devtools.targets[0]!.id : null);
-  }, [devtoolsOpen, devtools.targets, selectedDevtoolsTargetId, setSelectedDevtoolsTargetId]);
+  }, [effectiveDevtoolsOpen, devtools.targets, selectedDevtoolsTargetId, setSelectedDevtoolsTargetId]);
 
   useEffect(() => {
     setSelectedDevtoolsTargetId(null);
   }, [config.device, setSelectedDevtoolsTargetId]);
+
+  useEffect(() => {
+    if (!isAndroid) return;
+    setAxOverlayEnabled(false);
+    setDevtoolsOpen(false);
+    setSelectedDevtoolsTargetId(null);
+  }, [isAndroid, setAxOverlayEnabled, setDevtoolsOpen, setSelectedDevtoolsTargetId]);
 
   // Prefer H.264 (AVCC via WebCodecs) when the browser supports it; otherwise
   // fall back to MJPEG. The MJPEG reader stays dormant (null url) under AVCC so
@@ -468,8 +495,15 @@ function AppWithConfig({
   // H.264 profiles. Treat that as a hard override the viewer can't switch off.
   const serverForcesMjpeg = config.codec === "mjpeg";
   const useAvccVideo =
+    !isAndroid &&
     !serverForcesMjpeg && avcc.supported && !avccFallback.fellBack && !preferMjpeg && !forceMjpeg && codecPreference !== "mjpeg";
-  const mjpeg = useMjpegStream(useAvccVideo ? null : config.streamUrl);
+  const h264 = useH264Stream(config.streamUrl, isAndroid);
+  const mjpeg = useMjpegStream(
+    isAndroid
+      ? (h264.supported === false ? config.streamUrl : null)
+      : (useAvccVideo ? null : config.streamUrl),
+  );
+  const toolbarStreaming = isAndroid ? !!config.device : streaming;
 
   // Re-arm AVCC whenever the target stream changes (device switch / reconnect).
   useEffect(() => {
@@ -494,7 +528,8 @@ function AppWithConfig({
   // Screen config now arrives over the input WebSocket (pushed by the helper on
   // connect + on every dimension/orientation change) instead of a 1s /config poll.
   const [wsStreamConfig, setWsStreamConfig] = useState<StreamConfig | null>(null);
-  const streamConfig = wsStreamConfig;
+  const confirmedStreamConfig = isAndroid ? h264.config : wsStreamConfig;
+  const streamConfig = confirmedStreamConfig;
   const activeStreamConfig = liveStreamConfig ?? streamConfig ?? fallbackScreenSize(deviceType, deviceName);
   const imgBorderRadius = screenBorderRadius(deviceType, activeStreamConfig);
   const frameMaxWidth = simulatorMaxWidth(deviceType, activeStreamConfig);
@@ -778,7 +813,7 @@ function AppWithConfig({
         }
         return;
       }
-      if (e.code === "KeyA" && e.metaKey && e.shiftKey) {
+      if (platform === "ios" && e.code === "KeyA" && e.metaKey && e.shiftKey) {
         e.preventDefault();
         if (type === "down" && !e.repeat) {
           execOnHost(`xcrun simctl ui ${config.device} appearance`).then((r) => {
@@ -808,7 +843,7 @@ function AppWithConfig({
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
     };
-  }, [sendWs, config.device, rotateBy]);
+  }, [sendWs, config.device, platform, rotateBy]);
 
   const uploads = useUploadToasts();
   const screenshot = useScreenshotToast(config.device);
@@ -857,7 +892,7 @@ function AppWithConfig({
     const shiftNeeded = 2 * overlap;
     return shiftNeeded <= panelWidthPx + PANEL_GAP ? shiftNeeded : 0;
   };
-  const rightPanelWidthPx = devtoolsOpen
+  const rightPanelWidthPx = effectiveDevtoolsOpen
     ? devtoolsPanelWidth
     : panelOpen
     ? toolsPanelWidth
@@ -866,7 +901,7 @@ function AppWithConfig({
   const shiftForLeftPanel = shiftToClear(gridOpen ? gridPanelWidth : 0);
 
   return (
-    <AxStateProvider endpoint={axOverlayEnabled ? config?.axEndpoint : undefined}>
+    <AxStateProvider endpoint={supportsAx && axOverlayEnabled ? config?.axEndpoint : undefined}>
     <div
       className="flex flex-col items-center justify-center h-screen bg-page py-6 gap-3 font-system box-border"
       style={{
@@ -893,7 +928,7 @@ function AppWithConfig({
           deviceUdid={config.device}
           deviceName={deviceName}
           deviceRuntime={deviceRuntime}
-          streaming={streaming}
+          streaming={toolbarStreaming}
           aria-label="Simulator status"
           style={{
             alignSelf: "center",
@@ -914,11 +949,19 @@ function AppWithConfig({
             title="Simulators"
             hideSubtitle
             hideChevron
+            name={(
+              <span className="inline-flex min-w-0 items-center gap-1.5">
+                <PlatformBadge platform={platform} compact />
+                <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
+                  {deviceName ?? "Device"}
+                </span>
+              </span>
+            )}
             style={{
               maxWidth: "min(230px, calc(100vw - 170px))",
             }}
           />
-          <StreamStatusPill streaming={streaming} />
+          <StreamStatusPill streaming={toolbarStreaming} />
         </SimulatorToolbar>
         <div
           ref={simContainerRef}
@@ -968,10 +1011,17 @@ function AppWithConfig({
                 onStreamButton={onStreamButton}
                 onStreamDigitalCrown={onStreamDigitalCrown}
                 onStreamScroll={onStreamScroll}
-                codec={useAvccVideo ? "avcc" : "mjpeg"}
+                codec={isAndroid || !useAvccVideo ? "mjpeg" : "avcc"}
                 onAvccError={() => dispatchAvccFallback("error")}
-                subscribeFrame={useAvccVideo ? undefined : mjpeg.subscribeFrame}
-                streamFrame={useAvccVideo ? undefined : mjpeg.frame}
+                subscribeFrame={
+                  isAndroid
+                    ? (h264.supported === false ? mjpeg.subscribeFrame : undefined)
+                    : (useAvccVideo ? undefined : mjpeg.subscribeFrame)
+                }
+                subscribeVideoFrame={
+                  isAndroid && h264.supported !== false ? h264.subscribeVideoFrame : undefined
+                }
+                streamFrame={useAvccVideo || isAndroid ? undefined : mjpeg.frame}
                 streamConfig={activeStreamConfig}
                 enableDigitalCrown={deviceType === "watch"}
                 onScreenConfigChange={onScreenConfigChange}
@@ -980,7 +1030,7 @@ function AppWithConfig({
             const screenContent = (
               <>
                 {streamView}
-                {axOverlayEnabled && <AxDomOverlay />}
+                {supportsAx && axOverlayEnabled && <AxDomOverlay />}
               </>
             );
             if (!useChrome) return screenContent;
@@ -1015,7 +1065,7 @@ function AppWithConfig({
               style={{ borderRadius: useChrome ? undefined : imgBorderRadius }}
             >
               <Upload size={32} strokeWidth={1.5} />
-              <span className="text-[13px] font-medium">Drop media or .ipa</span>
+              <span className="text-[13px] font-medium">Drop media or {platform === "android" ? ".apk" : ".ipa"}</span>
             </div>
           )}
           <SimulatorResizeCornerHandle
@@ -1045,7 +1095,7 @@ function AppWithConfig({
             deviceUdid={config.device}
             deviceName={deviceName}
             deviceRuntime={deviceRuntime}
-            streaming={streaming}
+            streaming={toolbarStreaming}
             aria-label="Simulator actions"
             style={{
               alignSelf: "center",
@@ -1067,7 +1117,11 @@ function AppWithConfig({
                   <ReloadIcon />
                 </SimulatorToolbar.Button>
               )}
-              <SimulatorToolbar.HomeButton title="Home" />
+              {isAndroid ? (
+                <AndroidDeviceControls onButton={onStreamButton} />
+              ) : (
+                <SimulatorToolbar.HomeButton title="Home" />
+              )}
               <SimulatorToolbar.ScreenshotButton
                 title="Screenshot"
                 onClick={(e) => { e.preventDefault(); void screenshot.capture(); }}
@@ -1075,6 +1129,7 @@ function AppWithConfig({
               <SimulatorToolbar.RotateButton title="Rotate device" />
             </SimulatorToolbar.Actions>
           </SimulatorToolbar>
+          {supportsAx && (
           <SimulatorToolbar
             exec={execOnHost}
             onRotate={rotateDevice}
@@ -1082,7 +1137,7 @@ function AppWithConfig({
             deviceUdid={config.device}
             deviceName={deviceName}
             deviceRuntime={deviceRuntime}
-            streaming={streaming}
+            streaming={toolbarStreaming}
             aria-label="Accessibility overlay"
             style={{
               width: "auto",
@@ -1098,6 +1153,7 @@ function AppWithConfig({
               onToggleOverlay={() => setAxOverlayEnabled((enabled) => !enabled)}
             />
           </SimulatorToolbar>
+          )}
         </div>
       </div>
 
@@ -1106,7 +1162,7 @@ function AppWithConfig({
 
       {/* Right-edge rail: tools + WebKit DevTools. */}
       <div
-        className={`fixed top-3 right-3 flex flex-col gap-1 p-1 bg-panel-bg border border-white/8 rounded-[10px] backdrop-blur-[12px] [-webkit-backdrop-filter:blur(12px)] [transition:opacity_0.18s_ease] z-40 ${(panelOpen || devtoolsOpen) ? "opacity-0 pointer-events-none" : "opacity-100 pointer-events-auto"}`}
+        className={`fixed top-3 right-3 flex flex-col gap-1 p-1 bg-panel-bg border border-white/8 rounded-[10px] backdrop-blur-[12px] [-webkit-backdrop-filter:blur(12px)] [transition:opacity_0.18s_ease] z-40 ${(panelOpen || effectiveDevtoolsOpen) ? "opacity-0 pointer-events-none" : "opacity-100 pointer-events-auto"}`}
       >
         <button
           onClick={() => {
@@ -1120,6 +1176,7 @@ function AppWithConfig({
         >
           <PanelRight size={18} strokeWidth={1.75} />
         </button>
+        {supportsWebKitDevtools && (
         <button
           onClick={() => {
             setPanelOpen(false);
@@ -1132,6 +1189,7 @@ function AppWithConfig({
         >
           <Globe size={18} strokeWidth={1.75} />
         </button>
+        )}
       </div>
 
       <ToolsPanel
@@ -1156,8 +1214,9 @@ function AppWithConfig({
         ariaLabel="Resize tools panel"
       />
 
+      {supportsWebKitDevtools && (
       <WebKitDevtoolsPanel
-        open={devtoolsOpen}
+        open={effectiveDevtoolsOpen}
         onClose={() => setDevtoolsOpen(false)}
         udid={config.device}
         targets={devtools.targets}
@@ -1168,12 +1227,15 @@ function AppWithConfig({
         onRefresh={() => void devtools.refresh()}
         width={devtoolsPanelWidth}
       />
+      )}
+      {supportsWebKitDevtools && (
       <ResizeHandle
         panelWidth={devtoolsPanelWidth}
-        visible={devtoolsOpen}
+        visible={effectiveDevtoolsOpen}
         onPointerDown={onDevtoolsResize}
         ariaLabel="Resize WebKit DevTools panel"
       />
+      )}
     </div>
     </AxStateProvider>
   );

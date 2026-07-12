@@ -58,7 +58,7 @@ describe("uploadDroppedFile", () => {
     const commands: string[] = [];
     const progress: Array<number | null> = [];
 
-    await uploadDroppedFile(file, "media", recordingExec(commands), "UDID", (p) =>
+    await uploadDroppedFile(file, "media", recordingExec(commands), "UDID", "ios", (p) =>
       progress.push(p),
     );
 
@@ -80,7 +80,7 @@ describe("uploadDroppedFile", () => {
     expect(offset).toBe(original.length);
     expect(reassembled).toEqual(original);
 
-    expect(commands.some((c) => c.startsWith("xcrun simctl addmedia UDID "))).toBe(true);
+    expect(commands.some((c) => c.startsWith("xcrun simctl addmedia 'UDID' "))).toBe(true);
     expect(commands.some((c) => c.includes("rm -f "))).toBe(true);
 
     // Progress climbs monotonically, then flips to indeterminate for addmedia.
@@ -96,8 +96,8 @@ describe("uploadDroppedFile", () => {
   test("ipa drops install instead of addmedia", async () => {
     const file = new File([patternBytes(64)], "app.ipa", { type: "" });
     const commands: string[] = [];
-    await uploadDroppedFile(file, "ipa", recordingExec(commands), "UDID", () => {});
-    expect(commands.some((c) => c.startsWith("xcrun simctl install UDID "))).toBe(true);
+    await uploadDroppedFile(file, "ipa", recordingExec(commands), "UDID", "ios", () => {});
+    expect(commands.some((c) => c.startsWith("xcrun simctl install 'UDID' "))).toBe(true);
     expect(commands.some((c) => c.includes("addmedia"))).toBe(false);
   });
 
@@ -112,7 +112,7 @@ describe("uploadDroppedFile", () => {
     };
     const file = new File([patternBytes(64)], "shot.png", { type: "image/png" });
     await expect(
-      uploadDroppedFile(file, "media", exec, "UDID", () => {}),
+      uploadDroppedFile(file, "media", exec, "UDID", "ios", () => {}),
     ).rejects.toThrow("disk full");
     expect(commands.some((c) => c.includes("rm -f "))).toBe(true);
   });
